@@ -1,0 +1,120 @@
+name: Update NFL Data and Deploy
+
+on:
+  schedule:
+    # Monday 6 AM EST (11 AM UTC)
+    - cron: '0 11 * * 1'
+    # Tuesday 6 AM EST (11 AM UTC) 
+    - cron: '0 11 * * 2'
+    # Friday 6 AM EST (11 AM UTC)
+    - cron: '0 11 * * 5'
+  workflow_dispatch:  # Allows manual triggering
+
+jobs:
+  update-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up R
+      uses: r-lib/actions/setup-r@v2
+      with:
+        r-version: '4.3.0'
+        
+    - name: Set up Pandoc
+      uses: r-lib/actions/setup-pandoc@v2
+      
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
+        
+    - name: Cache R packages
+      uses: actions/cache@v3
+      with:
+        path: ${{ env.R_LIBS_USER }}
+        key: ${{ runner.os }}-r-${{ hashFiles('DESCRIPTION') }}
+        restore-keys: ${{ runner.os }}-r-
+        
+    - name: Install R dependencies
+      run: |
+        Rscript -e "
+        if (!require('pak')) install.packages('pak')
+        pak::pkg_install(c(
+          'tidyverse', 'nflverse', 'rvest', 'ggpattern', 
+          'shadowtext', 'vistime', 'ggthemes', 'showtext',
+          'sysfonts', 'ggtext', 'ggimage', 'gt', 'gtExtras',
+          'shiny', 'bslib', 'scales', 'rsconnect', 'mailR'
+        ))
+        "
+        
+    - name: Run data update script
+      run: |
+        Rscript -e "
+        tryCatch({
+          source('Sequence Play Comparisons.R')
+          cat('Data update completed successfully\n')
+        }, error = function(e) {
+          cat('Error in data update:', e$message, '\n')
+          # Send error email
+          if (file.exists('error_notification.R')) {
+            source('error_notification.R')
+            send_error_email('Data Update Failed', e$message)
+          }
+          quit(status = 1)
+        })
+        "
+        
+    - name: Check if data file exists
+      run: |
+        if [ ! -f "All Seq.csv" ]; then
+          echo "Error: All Seq.csv not found after data update"
+          exit 1
+        fi
+        echo "Data file confirmed to exist"
+        
+    - name: Deploy to shinyapps.io
+      run: |
+        Rscript -e "
+        tryCatch({
+          library(rsconnect)
+          
+          # Set up account
+          setAccountInfo(
+            name = '${{ secrets.SHINYAPPS_NAME }}',
+            token = '${{ secrets.SHINYAPPS_TOKEN }}',
+            secret = '${{ secrets.SHINYAPPS_SECRET }}'
+          )
+          
+          # Deploy app - CHANGE THIS APP NAME TO MATCH YOURS
+          deployApp(
+            appDir = '.',
+            appName = 'nfl-sequence',  # ← CHANGE THIS TO YOUR APP NAME
+            forceUpdate = TRUE
+          )
+          
+          cat('Deployment completed successfully\n')
+          
+        }, error = function(e) {
+          cat('Error in deployment:', e$message, '\n')
+          if (file.exists('error_notification.R')) {
+            source('error_notification.R')
+            send_error_email('Deployment Failed', e$message)
+          }
+          quit(status = 1)
+        })
+        "
+        
+    - name: Commit updated data (if any changes)
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add All\ Seq.csv
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "Update NFL data - $(date)"
+          git push
+        fi
